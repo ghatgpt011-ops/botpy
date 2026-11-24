@@ -490,6 +490,7 @@ refresh();
 app = Flask(__name__)
 
 
+@app.route("/")
 @app.route(PANEL_PATH)
 def page():
     return HTML
