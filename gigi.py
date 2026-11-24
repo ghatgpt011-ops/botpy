@@ -4,9 +4,11 @@ import logging
 import os
 import re
 import time
+from collections import deque
 from datetime import datetime
-from threading import Thread
+from threading import Lock, Thread
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from flask import Flask, request
 from splusthon import SoroushClient
@@ -19,7 +21,11 @@ PANEL_PATH = os.environ.get("PANEL_PATH", "/panel")
 if not PANEL_PATH.startswith("/"):
     PANEL_PATH = "/" + PANEL_PATH
 
+KEEPALIVE_URL = (os.environ.get("KEEPALIVE_URL") or "").strip()
+KEEPALIVE_INTERVAL = max(60, int(os.environ.get("KEEPALIVE_INTERVAL", "240")))
+
 MAX_SLOTS = 3
+MAX_CONSOLE_LINES = 140
 
 for _name in ("splusthon", "asyncio", "werkzeug"):
     logging.getLogger(_name).setLevel(logging.CRITICAL)
@@ -41,17 +47,39 @@ data = {
 }
 
 dialogs_cache = []
+console_logs = deque(maxlen=MAX_CONSOLE_LINES)
+console_lock = Lock()
+
 client = None
 bot_loop = None
 io_lock = asyncio.Lock()
+connect_lock = asyncio.Lock()
+_last_connect_try = 0.0
 
 
 def now_t() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
+def add_console_log(msg: str):
+    line = f"[{now_t()}] {str(msg).strip()}"
+    with console_lock:
+        console_logs.append(line)
+
+
+def get_console_logs() -> list:
+    with console_lock:
+        return list(console_logs)
+
+
+add_console_log("سرویس سرور با موتور خوداصلاح خطا راه‌اندازی شد.")
+
+
 def save_data():
     try:
+        parent_dir = os.path.dirname(os.path.abspath(STATE_FILE))
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(
@@ -79,6 +107,7 @@ def load_data():
                     if isinstance(raw_slots.get(k), dict):
                         data["slots"][k].update(raw_slots[k])
                 data["connected"] = False
+                add_console_log("وضعیت و سشن ذخیره‌شده بدون پاک شدن بارگذاری شد.")
         except Exception:
             pass
 
@@ -149,38 +178,82 @@ load_data()
 
 
 # ================= اتصال سروش و دریافت گروه‌ها =================
-async def connect_client() -> bool:
-    global client
+async def _safe_disconnect(c):
+    if c is None:
+        return
+    try:
+        if hasattr(c, "disconnect"):
+            res = c.disconnect()
+            if asyncio.iscoroutine(res):
+                await asyncio.wait_for(res, timeout=3)
+    except Exception:
+        pass
+
+
+async def connect_client(force: bool = False) -> bool:
+    global client, _last_connect_try
     sess = (data.get("session") or "").strip()
     if not sess:
         data["connected"] = False
         return False
-    try:
-        if client is None:
-            client = SoroushClient(StringSession(sess))
-        await asyncio.wait_for(client.connect(), timeout=12)
-        me = await asyncio.wait_for(client.get_me(), timeout=8)
-        fn = (getattr(me, "first_name", "") or "").strip()
-        ln = (getattr(me, "last_name", "") or "").strip()
-        data["account_name"] = (
-            f"{fn} {ln}".strip()
-            or getattr(me, "username", None)
-            or data["phone"]
-            or "متصل"
-        )
-        data["connected"] = True
-        data["last_error"] = "-"
-        return True
-    except Exception as e:
-        data["connected"] = False
-        data["last_error"] = str(e)[:120]
-        return False
+
+    async with connect_lock:
+        if data.get("connected") and client is not None and not force:
+            return True
+
+        now = time.monotonic()
+        if not force and (now - _last_connect_try) < 1.5:
+            return bool(data.get("connected"))
+        _last_connect_try = now
+
+        try:
+            if force or client is None:
+                await _safe_disconnect(client)
+                client = SoroushClient(StringSession(sess))
+
+            if hasattr(client, "is_connected"):
+                try:
+                    already = client.is_connected()
+                    if asyncio.iscoroutine(already):
+                        already = await already
+                    if not already:
+                        await asyncio.wait_for(client.connect(), timeout=12)
+                except Exception:
+                    await asyncio.wait_for(client.connect(), timeout=12)
+            else:
+                await asyncio.wait_for(client.connect(), timeout=12)
+
+            me = await asyncio.wait_for(client.get_me(), timeout=8)
+            fn = (getattr(me, "first_name", "") or "").strip()
+            ln = (getattr(me, "last_name", "") or "").strip()
+            data["account_name"] = (
+                f"{fn} {ln}".strip()
+                or getattr(me, "username", None)
+                or data["phone"]
+                or "متصل"
+            )
+            was_connected = bool(data.get("connected"))
+            data["connected"] = True
+            data["last_error"] = "-"
+            if not was_connected:
+                add_console_log(f"اکانت با حفظ سشن متصل شد: {data['account_name']}")
+            return True
+        except Exception as e:
+            data["connected"] = False
+            err_s = str(e)[:120]
+            data["last_error"] = err_s
+            add_console_log(f"خطای اتصال: {err_s}")
+            await _safe_disconnect(client)
+            client = None
+            return False
 
 
 async def fetch_groups_list():
     global dialogs_cache
+    add_console_log("در حال دریافت لیست گروه‌ها و کانال‌ها...")
     ok = await connect_client()
     if not ok or client is None:
+        add_console_log("دریافت لیست ناموفق بود؛ اکانت متصل نیست.")
         return dialogs_cache
     try:
         raw = []
@@ -203,9 +276,13 @@ async def fetch_groups_list():
                 gc_only.append(item)
 
         dialogs_cache = gc_only if gc_only else all_items
+        add_console_log(f"لیست دریافت شد ({len(dialogs_cache)} مورد).")
         return dialogs_cache
     except Exception as e:
-        data["last_error"] = str(e)[:120]
+        err_s = str(e)[:120]
+        data["last_error"] = err_s
+        data["connected"] = False
+        add_console_log(f"خطا در دریافت لیست: {err_s}")
         return dialogs_cache
 
 
@@ -213,44 +290,54 @@ async def do_send_code(phone: str):
     global client
     data["phone"] = phone
     data["auth_msg"] = "در حال ارسال کد..."
+    add_console_log(f"درخواست ارسال کد برای {phone}...")
     try:
-        client = SoroushClient(StringSession())
-        await asyncio.wait_for(client.connect(), timeout=15)
-        if hasattr(client, "send_code_request"):
-            res = await asyncio.wait_for(client.send_code_request(phone), timeout=15)
-            data["code_hash"] = getattr(res, "phone_code_hash", None)
-        elif hasattr(client, "send_code"):
-            res = await asyncio.wait_for(client.send_code(phone), timeout=15)
-            data["code_hash"] = getattr(res, "phone_code_hash", None)
-        else:
-            await asyncio.wait_for(client.sign_in(phone=phone), timeout=15)
+        async with connect_lock:
+            await _safe_disconnect(client)
+            client = SoroushClient(StringSession())
+            await asyncio.wait_for(client.connect(), timeout=15)
+            if hasattr(client, "send_code_request"):
+                res = await asyncio.wait_for(client.send_code_request(phone), timeout=15)
+                data["code_hash"] = getattr(res, "phone_code_hash", None)
+            elif hasattr(client, "send_code"):
+                res = await asyncio.wait_for(client.send_code(phone), timeout=15)
+                data["code_hash"] = getattr(res, "phone_code_hash", None)
+            else:
+                await asyncio.wait_for(client.sign_in(phone=phone), timeout=15)
         data["auth_msg"] = "کد ارسال شد؛ کد را وارد کنید."
+        add_console_log("کد تأیید ارسال شد.")
     except Exception as e:
         data["auth_msg"] = f"خطا: {e}"
+        add_console_log(f"خطای ارسال کد: {str(e)[:120]}")
 
 
 async def do_verify_code(code: str):
     phone = data.get("phone", "").strip()
+    add_console_log("در حال بررسی کد تأیید...")
     try:
         if client is None:
             raise RuntimeError("ابتدا شماره را بفرستید.")
-        if data.get("code_hash"):
-            try:
-                await asyncio.wait_for(
-                    client.sign_in(phone=phone, code=code, phone_code_hash=data["code_hash"]),
-                    timeout=15,
-                )
-            except TypeError:
-                await asyncio.wait_for(client.sign_in(phone, code, data["code_hash"]), timeout=15)
-        else:
-            await asyncio.wait_for(client.sign_in(phone=phone, code=code), timeout=15)
+        async with connect_lock:
+            if data.get("code_hash"):
+                try:
+                    await asyncio.wait_for(
+                        client.sign_in(phone=phone, code=code, phone_code_hash=data["code_hash"]),
+                        timeout=15,
+                    )
+                except TypeError:
+                    await asyncio.wait_for(client.sign_in(phone, code, data["code_hash"]), timeout=15)
+            else:
+                await asyncio.wait_for(client.sign_in(phone=phone, code=code), timeout=15)
 
         data["session"] = client.session.save() if getattr(client, "session", None) else ""
         data["connected"] = True
+        data["last_error"] = "-"
         data["auth_msg"] = "با موفقیت وارد شد."
         save_data()
+        add_console_log("ورود به اکانت با موفقیت انجام شد.")
     except Exception as e:
         data["auth_msg"] = f"خطا در کد: {e}"
+        add_console_log(f"خطای تأیید کد: {str(e)[:120]}")
 
 
 def run_async(coro):
@@ -259,47 +346,140 @@ def run_async(coro):
     return None
 
 
+# ================= موتور تشخیص و اصلاح خودکار خطا =================
+async def auto_heal_slot_error(slot_num: str, slot: dict, err: Exception, consecutive_errors: int):
+    """
+    خطای رخ‌داده را بدون پاک کردن سشن تحلیل و اصلاح می‌کند.
+    خروجی: (backoff_seconds: float, should_retry_immediately: bool)
+    """
+    err_raw = str(err or "")
+    err_low = err_raw.lower()
+    err_short = err_raw[:120]
+
+    # ۱. محدودیت سرعت / Flood
+    if any(k in err_low for k in ("flood", "rate", "too many", "limit", "429", "slow")):
+        wait_sec = min(15.0, max(2.5, 2.0 * consecutive_errors))
+        add_console_log(f"[اصلاح خودکار جای {slot_num}] محدودیت ارسال تشخیص داده شد؛ مکث {wait_sec:.1f}s و ادامه همان پیام.")
+        return wait_sec, False
+
+    # ۲. خطای مقصد / Peer / آیدی / یوزرنیم
+    if any(k in err_low for k in ("peer", "chat", "user", "resolve", "not found", "invalid", "target")):
+        current_tgt = str(slot.get("target_chat") or "").strip()
+        fixed_tgt = parse_target(current_tgt)
+        if not fixed_tgt.lstrip("-").isdigit() and dialogs_cache:
+            name_key = str(slot.get("target_name") or "").strip()
+            matched = next(
+                (g.get("id") for g in dialogs_cache if name_key and str(g.get("name", "")).strip() == name_key),
+                None,
+            )
+            if matched:
+                fixed_tgt = str(matched)
+        if fixed_tgt and fixed_tgt != current_tgt:
+            slot["target_chat"] = fixed_tgt
+            save_data()
+            add_console_log(f"[اصلاح خودکار جای {slot_num}] فرمت مقصد اصلاح شد ({current_tgt} -> {fixed_tgt})؛ تلاش مجدد برای همان پیام.")
+            return 0.3, True
+
+    # ۳. خطای اتصال / شبکه / تایم‌اوت / کلاینت (با حفظ کامل سشن)
+    if any(
+        k in err_low
+        for k in (
+            "timeout",
+            "timed out",
+            "connect",
+            "connection",
+            "network",
+            "socket",
+            "closed",
+            "reset",
+            "broken pipe",
+            "client",
+            "session",
+            "auth",
+            "eof",
+        )
+    ) or consecutive_errors >= 1:
+        data["connected"] = False
+        add_console_log(f"[اصلاح خودکار جای {slot_num}] خطای «{err_short}» گرفته شد؛ در حال بازاتصال با سشن فعلی...")
+        ok = await connect_client(force=True)
+        if ok:
+            add_console_log(f"[اصلاح خودکار جای {slot_num}] اتصال اصلاح شد؛ ادامه ارسال همان پیام.")
+            return 0.2, True
+        wait_sec = min(6.0, 1.0 * consecutive_errors)
+        return wait_sec, False
+
+    return min(4.0, 0.7 * consecutive_errors), False
+
+
 async def slot_worker(slot_num: str):
     slot = data["slots"][slot_num]
+    consecutive_errors = 0
+    retry_now = False
+
     while True:
         try:
-            if not slot.get("running") or not slot.get("target_chat") or not slot.get("text"):
+            if not slot.get("running"):
+                consecutive_errors = 0
+                retry_now = False
                 await asyncio.sleep(0.15)
                 continue
 
-            if not data.get("connected") or client is None:
-                await connect_client()
-                await asyncio.sleep(0.8)
+            if not str(slot.get("target_chat") or "").strip() or not str(slot.get("text") or "").strip():
+                slot["running"] = False
+                data["last_error"] = "مقصد یا متن خالی است."
+                add_console_log(f"[اصلاح خودکار جای {slot_num}] مقصد یا متن خالی بود؛ اسلات ایمن متوقف شد.")
+                save_data()
+                await asyncio.sleep(0.2)
                 continue
 
+            if not data.get("connected") or client is None:
+                ok = await connect_client()
+                await asyncio.sleep(0.3 if ok else 1.0)
+                continue
+
+            # دستور در حال اجرا (همان مقصد و همان متن تا زمان ارسال موفق)
             peer = to_peer(str(slot["target_chat"]))
             msg = str(slot["text"])
 
             async with io_lock:
                 await asyncio.wait_for(client.send_message(peer, msg), timeout=10)
 
-            slot["sent"] = int(slot.get("sent") or 0) + 1
+            consecutive_errors = 0
+            retry_now = False
+            new_count = int(slot.get("sent") or 0) + 1
+            slot["sent"] = new_count
             slot["last_at"] = now_t()
             data["last_error"] = "-"
-            if slot["sent"] % 10 == 0:
+            dest_label = slot.get("target_name") or slot.get("target_chat")
+            add_console_log(f"[جای {slot_num}] پیام #{new_count} به «{dest_label}» ارسال شد.")
+
+            if new_count % 5 == 0:
                 save_data()
 
             await asyncio.sleep(max(0.1, float(data.get("speed") or 1.0)))
+
         except Exception as e:
-            data["last_error"] = str(e)[:120]
-            data["connected"] = False
-            await asyncio.sleep(0.8)
+            consecutive_errors += 1
+            err_s = str(e)[:120]
+            data["last_error"] = err_s
+            wait_sec, retry_now = await auto_heal_slot_error(slot_num, slot, e, consecutive_errors)
+            if not retry_now:
+                await asyncio.sleep(wait_sec)
 
 
 async def runner_main():
     global bot_loop
     bot_loop = asyncio.get_running_loop()
+    add_console_log("حلقه اصلی ارسال و خوداصلاح‌کننده خطا فعال شد.")
+
     if (data.get("session") or "").strip():
-        await connect_client()
+        await connect_client(force=True)
+
     for s_num in ("1", "2", "3"):
         asyncio.create_task(slot_worker(s_num))
+
     while True:
-        await asyncio.sleep(4)
+        await asyncio.sleep(3)
         if (data.get("session") or "").strip() and not data.get("connected"):
             await connect_client()
 
@@ -310,11 +490,28 @@ def start_bot():
     while True:
         try:
             loop.run_until_complete(runner_main())
-        except Exception:
+        except Exception as e:
+            data["connected"] = False
+            err_s = str(e)[:120]
+            data["last_error"] = err_s
+            add_console_log(f"[اصلاح خودکار حلقه اصلی] خطای «{err_s}» گرفته شد؛ در حال بازیابی...")
             time.sleep(1)
 
 
-# ================= پنل ساده تک‌رنگ =================
+def run_keepalive():
+    if not KEEPALIVE_URL:
+        return
+    while True:
+        time.sleep(KEEPALIVE_INTERVAL)
+        try:
+            req = Request(KEEPALIVE_URL, headers={"User-Agent": "KeepAliveBot/1.0"})
+            with urlopen(req, timeout=10) as _:
+                pass
+        except Exception:
+            pass
+
+
+# ================= پنل ساده تک‌رنگ + ترمینال سرور =================
 HTML = """<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
@@ -331,16 +528,43 @@ HTML = """<!DOCTYPE html>
   button:hover { background: #333; }
   .slot-box { border: 1px solid #2e2e2e; background: #151515; border-radius: 4px; padding: 8px; margin-top: 8px; font-size: 12px; line-height: 1.7; }
   .stat-line { font-size: 13px; margin: 6px 0; line-height: 1.7; }
+  .term-box {
+    background: #0b0b0b;
+    border: 1px solid #2c2c2c;
+    border-radius: 4px;
+    padding: 8px;
+    height: 220px;
+    overflow-y: auto;
+    font-family: Consolas, monospace;
+    font-size: 11px;
+    line-height: 1.6;
+    color: #d6d6d6;
+    direction: ltr;
+    text-align: left;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .term-row { display: flex; gap: 8px; }
+  .term-row button { margin-top: 6px; }
 </style>
 </head>
 <body>
 
 <div class="box">
   <h3>آمار و وضعیت سرور</h3>
-  <div class="stat-line">اکانت: <b id="st_acc">-</b> | فعال: <b id="st_act">0 / 3</b></div>
+  <div class="stat-line">اکانت: <b id="st_acc">-</b> | اتصال: <b id="st_conn">قطع</b> | فعال: <b id="st_act">0 / 3</b></div>
   <div class="stat-line">خطا: <span id="st_err" dir="ltr">-</span></div>
   <div id="slots_stats"></div>
   <button onclick="stopAll()">توقف همه</button>
+</div>
+
+<div class="box">
+  <h3>ترمینال زنده و خوداصلاح‌کننده سرور</h3>
+  <div id="term_view" class="term-box">در حال اتصال به لاگ سرور...</div>
+  <div class="term-row">
+    <button onclick="clearTerm()">پاک کردن لاگ</button>
+    <button onclick="stopAll()">توقف فوری ارسال</button>
+  </div>
 </div>
 
 <div class="box">
@@ -444,6 +668,10 @@ async function stopAll(){
   await fetch('/api/stop_all');
   refresh();
 }
+async function clearTerm(){
+  await fetch('/api/logs_clear', {method: 'POST'});
+  refresh();
+}
 
 let firstLoad = true;
 async function refresh(){
@@ -458,16 +686,25 @@ async function refresh(){
       const s = slots[n] || {};
       if(s.running) activeCnt++;
       html += `<div class="slot-box">
-        <div><b>جای ${n}</b>: <b>${s.running ? 'در حال اسپم' : 'متوقف'}</b> | ارسال: <b>${s.sent || 0}</b></div>
+        <div><b>جای ${n}</b>: <b>${s.running ? 'در حال اسپم' : 'متوقف'}</b> | ارسال: <b>${s.sent || 0}</b> | آخرین: <b>${esc(s.last_at || '-')}</b></div>
         <div>محل: <b>${esc(s.target_name || s.target_chat || '-')}</b> | متن: <b>${esc(s.text || '-')}</b></div>
       </div>`;
     });
 
     document.getElementById('slots_stats').innerHTML = html;
     document.getElementById('st_acc').innerText = d.account_name || '-';
+    document.getElementById('st_conn').innerText = d.connected ? 'متصل' : 'قطع';
     document.getElementById('st_act').innerText = activeCnt + ' / 3';
     document.getElementById('st_err').innerText = d.last_error || '-';
     document.getElementById('auth_msg').innerText = d.auth_msg || '-';
+
+    const logs = Array.isArray(d.logs) ? d.logs : [];
+    const termEl = document.getElementById('term_view');
+    const nearBottom = (termEl.scrollHeight - termEl.scrollTop - termEl.clientHeight) < 28;
+    termEl.innerText = logs.length ? logs.join('\\n') : 'هنوز لاگی ثبت نشده است.';
+    if (firstLoad || nearBottom) {
+      termEl.scrollTop = termEl.scrollHeight;
+    }
 
     if(firstLoad){
       firstLoad = false;
@@ -504,7 +741,16 @@ def health():
 @app.route("/api/stats")
 def api_stats():
     payload = {k: v for k, v in data.items() if k not in ("code_hash", "session")}
+    payload["logs"] = get_console_logs()
     return app.response_class(json.dumps(payload, ensure_ascii=False), mimetype="application/json")
+
+
+@app.route("/api/logs_clear", methods=["POST"])
+def api_logs_clear():
+    with console_lock:
+        console_logs.clear()
+    add_console_log("لاگ ترمینال پاک شد.")
+    return "", 200
 
 
 @app.route("/api/phone")
@@ -542,6 +788,7 @@ def api_slot_start():
     if n in ("1", "2", "3"):
         if active_running_count(exclude_slot=n) >= MAX_SLOTS:
             data["last_error"] = "هم‌زمان بیشتر از ۳ جا نمی‌توان اسپم زد."
+            add_console_log("درخواست رد شد: هم‌زمان حداکثر ۳ اسلات مجاز است.")
             save_data()
             return "", 200
         raw_tgt = str(body.get("target") or "").strip()
@@ -562,8 +809,10 @@ def api_slot_start():
         if s.get("target_chat") and s.get("text"):
             s["running"] = True
             data["last_error"] = "-"
+            add_console_log(f"[جای {n}] ارسال شروع شد -> {s.get('target_name') or s.get('target_chat')}")
         else:
             data["last_error"] = "مقصد و متن را وارد کنید."
+            add_console_log(f"[جای {n}] خطا: مقصد یا متن خالی است.")
         save_data()
     return "", 200
 
@@ -573,6 +822,7 @@ def api_slot_stop():
     n = (request.args.get("slot") or "").strip()
     if n in ("1", "2", "3"):
         data["slots"][n]["running"] = False
+        add_console_log(f"[جای {n}] ارسال متوقف شد.")
         save_data()
     return "", 200
 
@@ -581,6 +831,7 @@ def api_slot_stop():
 def api_stop_all():
     for s in data["slots"].values():
         s["running"] = False
+    add_console_log("همه اسلات‌ها متوقف شدند.")
     save_data()
     return "", 200
 
@@ -596,5 +847,6 @@ def run_web():
 if __name__ == "__main__":
     Thread(target=run_web, daemon=True).start()
     Thread(target=start_bot, daemon=True).start()
+    Thread(target=run_keepalive, daemon=True).start()
     while True:
         time.sleep(1)
