@@ -29,7 +29,14 @@ for name in ("splusthon", "asyncio", "werkzeug"):
 
 
 def make_slot(idx: str) -> dict:
-    return {"text": f"پیام {idx}", "target_chat": "", "target_name": "-", "running": False, "sent": 0, "last_at": "-"}
+    return {
+        "text": f"پیام {idx}",
+        "target_chat": "",
+        "target_name": "-",
+        "running": False,
+        "sent": 0,
+        "last_at": "-",
+    }
 
 
 data = {
@@ -48,10 +55,11 @@ dialogs_cache = []
 console_logs = deque(maxlen=140)
 console_lock = Lock()
 state_lock = Lock()
+
 client = None
 bot_loop = None
-io_lock = asyncio.Lock()
-connect_lock = asyncio.Lock()
+io_lock = None
+connect_lock = None
 _last_connect_try = 0.0
 
 
@@ -80,7 +88,12 @@ def save_data():
                 os.makedirs(parent, exist_ok=True)
             tmp = STATE_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({k: v for k, v in data.items() if k != "code_hash"}, f, ensure_ascii=False, indent=2)
+                json.dump(
+                    {k: v for k, v in data.items() if k != "code_hash"},
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
             os.replace(tmp, STATE_FILE)
         except Exception:
             pass
@@ -164,7 +177,11 @@ def extract_dialog(d):
         or getattr(ent, "first_name", None)
         or str(did)
     )
-    is_grp = bool(getattr(d, "is_group", False) or getattr(ent, "megagroup", False) or getattr(ent, "gigagroup", False))
+    is_grp = bool(
+        getattr(d, "is_group", False)
+        or getattr(ent, "megagroup", False)
+        or getattr(ent, "gigagroup", False)
+    )
     is_chn = bool(getattr(d, "is_channel", False) or getattr(ent, "broadcast", False))
     dtype = "کانال" if is_chn else ("گروه" if is_grp else "چت")
     return {"id": str(did), "name": str(name), "type": dtype, "is_gc": bool(is_grp or is_chn)}
@@ -186,7 +203,10 @@ async def _disconnect(c):
 
 
 async def connect_client(force: bool = False) -> bool:
-    global client, _last_connect_try
+    global client, _last_connect_try, connect_lock
+    if connect_lock is None:
+        connect_lock = asyncio.Lock()
+
     sess = (data.get("session") or "").strip()
     if not sess:
         data["connected"] = False
@@ -204,6 +224,7 @@ async def connect_client(force: bool = False) -> bool:
             if force or client is None:
                 await _disconnect(client)
                 client = SoroushClient(StringSession(sess))
+
             if hasattr(client, "is_connected"):
                 try:
                     conn = client.is_connected()
@@ -261,7 +282,7 @@ async def fetch_groups():
                 gc_only.append(item)
 
         if gc_only or all_items:
-            dialogs_cache = gc_only or all_items
+            dialogs_cache = gc_only if gc_only else all_items
         for s in data["slots"].values():
             sync_target_name(s)
         save_data()
@@ -276,7 +297,9 @@ async def fetch_groups():
 
 
 async def do_send_code(phone: str):
-    global client
+    global client, connect_lock
+    if connect_lock is None:
+        connect_lock = asyncio.Lock()
     data["phone"] = phone
     data["auth_msg"] = "در حال ارسال کد..."
     log_line(f"ارسال کد برای {phone}...")
@@ -301,6 +324,9 @@ async def do_send_code(phone: str):
 
 
 async def do_verify_code(code: str):
+    global connect_lock
+    if connect_lock is None:
+        connect_lock = asyncio.Lock()
     phone = data.get("phone", "").strip()
     log_line("در حال بررسی کد تأیید...")
     try:
@@ -309,7 +335,10 @@ async def do_verify_code(code: str):
         async with connect_lock:
             if data.get("code_hash"):
                 try:
-                    await asyncio.wait_for(client.sign_in(phone=phone, code=code, phone_code_hash=data["code_hash"]), timeout=15)
+                    await asyncio.wait_for(
+                        client.sign_in(phone=phone, code=code, phone_code_hash=data["code_hash"]),
+                        timeout=15,
+                    )
                 except TypeError:
                     await asyncio.wait_for(client.sign_in(phone, code, data["code_hash"]), timeout=15)
             else:
@@ -327,7 +356,9 @@ async def do_verify_code(code: str):
 
 
 def run_async(coro):
-    return asyncio.run_coroutine_threadsafe(coro, bot_loop) if bot_loop and not bot_loop.is_closed() else None
+    if bot_loop and not bot_loop.is_closed():
+        return asyncio.run_coroutine_threadsafe(coro, bot_loop)
+    return None
 
 
 async def heal_error(slot_num: str, slot: dict, err: Exception, errs: int):
@@ -343,7 +374,10 @@ async def heal_error(slot_num: str, slot: dict, err: Exception, errs: int):
         fixed = parse_target(cur)
         if not fixed.lstrip("-").isdigit() and dialogs_cache:
             name_key = str(slot.get("target_name") or "").strip()
-            matched = next((g.get("id") for g in dialogs_cache if name_key and str(g.get("name", "")).strip() == name_key), None)
+            matched = next(
+                (g.get("id") for g in dialogs_cache if name_key and str(g.get("name", "")).strip() == name_key),
+                None,
+            )
             if matched:
                 fixed = str(matched)
         if fixed and fixed != cur:
@@ -362,6 +396,10 @@ async def heal_error(slot_num: str, slot: dict, err: Exception, errs: int):
 
 
 async def slot_worker(slot_num: str):
+    global io_lock
+    if io_lock is None:
+        io_lock = asyncio.Lock()
+
     slot = data["slots"][slot_num]
     errs = 0
     retry_now = False
@@ -409,8 +447,10 @@ async def slot_worker(slot_num: str):
 
 
 async def runner_main():
-    global bot_loop
+    global bot_loop, io_lock, connect_lock
     bot_loop = asyncio.get_running_loop()
+    io_lock = asyncio.Lock()
+    connect_lock = asyncio.Lock()
     log_line("حلقه ارسال فعال شد.")
     if (data.get("session") or "").strip():
         await connect_client(force=True)
